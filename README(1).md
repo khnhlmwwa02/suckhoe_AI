@@ -185,29 +185,6 @@ Twenty consecutive tests produced valid analysis results without data loss or in
 - AI processing time after measurement: approximately **10 seconds**
 - The distributed nodes and central server maintained stable communication during testing
 
-## Repository Structure
-
-A simple one-level repository structure can be used:
-
-```text
-stroke-patient-assistance-system/
-├── gateway.ino
-├── hand-control-node.ino
-├── foot-control-node.ino
-├── non-contact-node.ino
-├── nextion-interface.HMI
-├── n8n-workflow.json
-├── mobile-app-source.zip
-├── system-architecture.png
-├── gateway-pcb.png
-├── node1-pcb.png
-├── node2-pcb.png
-├── node3-pcb.png
-├── prototype.jpg
-├── project-report.pdf
-└── README.md
-```
-
 Only include files that are actually available in the project.
 
 ## Setup
