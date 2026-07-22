@@ -1,0 +1,591 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <DFRobot_MAX30102.h>
+
+// ===== DS18B20 =====
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ================= WIFI/UDP =================
+const char* WIFI_SSID = "iPhone";
+const char* WIFI_PASS = "12341234";
+
+// Master nhận joystick + nhận RES
+const uint16_t MASTER_PORT_9000 = 9000;
+
+// Slave listen D
+const uint16_t SLAVE_LISTEN_PORT = 9100;
+
+// Fallback ack port (nếu remotePort bị 0)
+const uint16_t MASTER_ACK_FALLBACK = 9200;
+
+WiFiUDP Udp;
+char rxBuf[96];
+
+// ================= DEBUG =================
+#define DEBUG 1
+#if DEBUG
+  #define DBG(x)   Serial.print(x)
+  #define DBGLN(x) Serial.println(x)
+#else
+  #define DBG(x)
+  #define DBGLN(x)
+#endif
+
+// ========== MASTER tracking ==========
+IPAddress MASTER_IP(0,0,0,0);
+bool masterKnown = false;
+
+// ================= BUTTON on GPIO8 (INPUT_PULLUP) =================
+static const int PIN_BTN8 = 8;
+static const uint32_t BTN8_DEBOUNCE_MS = 60;
+
+bool btn8_lastRaw = true;
+bool btn8_stable  = true;
+uint32_t btn8_changeMs = 0;
+bool btn8_wasPressed = false;
+
+// ================= JOYSTICK PINS =================
+static const int PIN_SW  = 5;
+
+// HOÁN ĐỔI TRỤC:
+// VRY (6) -> TRỤC X
+// VRX (7) -> TRỤC Y
+static const int PIN_VRY = 6;  // X
+static const int PIN_VRX = 7;  // Y
+
+// ================= JOYSTICK THRESHOLD =================
+static const int ADC_MID  = 2048;
+static const int DEADZONE = 450;
+static const int THRESH   = 900;
+
+static const uint32_t SW_DEBOUNCE_MS   = 60;
+static const uint32_t SEND_COOLDOWN_MS = 80;
+
+enum StickState { ST_IDLE, ST_X_POS, ST_X_NEG, ST_Y_POS, ST_Y_NEG };
+StickState lastStickState = ST_IDLE;
+uint32_t lastSendMs = 0;
+
+// SW state
+bool lastSwRaw = true;
+bool swStable  = true;
+uint32_t swChangeMs = 0;
+
+// ================= I2C (GPIO2 SDA, GPIO4 SCL) =================
+static const int I2C_SDA = 2;
+static const int I2C_SCL = 4;
+
+DFRobot_MAX30102 particleSensor;
+bool hr_ok = false;
+
+// ================= SAMPLING =================
+volatile bool samplingActive = false;
+volatile bool samplingPending = false;
+
+static const uint32_t PREPARE_DELAY_MS = 5000;   // chờ 2 giây sau khi nhận lệnh D
+uint32_t samplingPendingStartMs = 0;
+
+// 15s sampling
+static const uint32_t SAMPLE_WINDOW_MS = 15000;
+uint32_t sampleStartMs = 0;
+
+// tích lũy kết quả valid trong 15 giây
+int32_t hrSum = 0;
+int32_t spo2Sum = 0;
+float tempSum = 0.0f;
+int hrCount = 0;
+int spo2Count = 0;
+int tempCount = 0;
+uint32_t tempLastReadMs = 0;
+
+// ================= DS18B20 =================
+static const int DS_PIN = 1;
+OneWire oneWire(DS_PIN);
+DallasTemperature ds18b20(&oneWire);
+bool ds_ok = false;
+float tempC_last = NAN;
+
+// ===== Finger detect / abort =====
+bool fingerDetectedEver = false;
+uint32_t fingerLostStartMs = 0;
+bool fingerLostNow = false;
+const uint32_t FINGER_LOST_ABORT_MS = 1200;
+
+void udpSendJoyBroadcast(const char* msg);
+void udpSendTo(IPAddress ip, uint16_t port, const char* msg);
+
+void handleButton8OneShot() {
+  bool raw = digitalRead(PIN_BTN8);  // pullup: nhấn = LOW
+
+  if (raw != btn8_lastRaw) {
+    btn8_lastRaw = raw;
+    btn8_changeMs = millis();
+  }
+
+  if (millis() - btn8_changeMs >= BTN8_DEBOUNCE_MS) {
+    if (btn8_stable != raw) {
+      btn8_stable = raw;
+
+      if (btn8_stable == LOW) {
+        btn8_wasPressed = true;
+      }
+      else {
+        if (btn8_wasPressed) {
+          udpSendJoyBroadcast("4");
+          btn8_wasPressed = false;
+        }
+      }
+    }
+  }
+}
+
+// đọc nhiệt độ (trả NAN nếu lỗi)
+float readTempC_DS18B20() {
+  if (!ds_ok) return NAN;
+
+  ds18b20.requestTemperatures();
+  float t = ds18b20.getTempCByIndex(0);
+
+  if (t == DEVICE_DISCONNECTED_C || t < -50.0f || t > 125.0f) return NAN;
+  if (t == 85.0f) return NAN;
+  return t;
+}
+
+bool max30102Init() {
+  if (!particleSensor.begin(&Wire, 0x57)) {
+    return false;
+  }
+
+  particleSensor.sensorConfiguration(
+    /*ledBrightness=*/0x1F,
+    /*sampleAverage=*/SAMPLEAVG_4,
+    /*ledMode=*/MODE_MULTILED,
+    /*sampleRate=*/SAMPLERATE_100,
+    /*pulseWidth=*/PULSEWIDTH_411,
+    /*adcRange=*/ADCRANGE_4096
+  );
+
+  delay(100);
+  return true;
+}
+
+// ================= UDP send =================
+void udpSendTo(IPAddress ip, uint16_t port, const char* msg) {
+  Udp.beginPacket(ip, port);
+  Udp.print(msg);
+  Udp.endPacket();
+}
+
+// Joystick: broadcast để không phụ thuộc MASTER_IP
+void udpSendJoyBroadcast(const char* msg) {
+  uint32_t now = millis();
+  if (now - lastSendMs < SEND_COOLDOWN_MS) return;
+
+  IPAddress bcast(255,255,255,255);
+  Udp.beginPacket(bcast, MASTER_PORT_9000);
+  Udp.print(msg);
+  Udp.endPacket();
+
+  lastSendMs = now;
+}
+
+// ================= JOYSTICK =================
+StickState readStickState(int x, int y) {
+  int dx = x - ADC_MID;
+  int dy = y - ADC_MID;
+
+  if (abs(dx) < DEADZONE && abs(dy) < DEADZONE) return ST_IDLE;
+
+  if (abs(dx) >= abs(dy)) {
+    if (dx > THRESH)  return ST_X_POS;
+    if (dx < -THRESH) return ST_X_NEG;
+  } else {
+    if (dy > THRESH)  return ST_Y_POS;
+    if (dy < -THRESH) return ST_Y_NEG;
+  }
+  return lastStickState;
+}
+
+void handleStick() {
+  int x = analogRead(PIN_VRY);
+  int y = analogRead(PIN_VRX);
+
+  StickState st = readStickState(x, y);
+
+  if (lastStickState == ST_IDLE && st != ST_IDLE) {
+    switch (st) {
+      case ST_X_POS: udpSendJoyBroadcast("-1"); break;
+      case ST_X_NEG: udpSendJoyBroadcast("1");  break;
+      case ST_Y_NEG: udpSendJoyBroadcast("-2"); break;
+      case ST_Y_POS: udpSendJoyBroadcast("2");  break;
+      default: break;
+    }
+  }
+
+  if (st == ST_IDLE) lastStickState = ST_IDLE;
+  else if (lastStickState == ST_IDLE) lastStickState = st;
+}
+
+void handleSwitch() {
+  bool raw = digitalRead(PIN_SW);
+
+  if (raw != lastSwRaw) {
+    lastSwRaw = raw;
+    swChangeMs = millis();
+  }
+
+  if (millis() - swChangeMs >= SW_DEBOUNCE_MS) {
+    if (swStable != raw) {
+      swStable = raw;
+      if (swStable == LOW) udpSendJoyBroadcast("3");
+    }
+  }
+}
+
+// ================= Sampling control =================
+void startSampling() {
+  if (!hr_ok) {
+    samplingActive = false;
+    samplingPending = false;
+    DBGLN("MAX30102 not ready -> cannot start sampling");
+    return;
+  }
+
+  samplingPending = false;
+  samplingActive = true;
+
+  sampleStartMs = millis();
+  hrSum = 0;
+  spo2Sum = 0;
+  hrCount = 0;
+  spo2Count = 0;
+  tempSum = 0.0f;
+  tempCount = 0;
+  fingerDetectedEver = false;
+  fingerLostStartMs = 0;
+  fingerLostNow = false;
+
+  tempC_last = readTempC_DS18B20();
+  tempLastReadMs = millis();
+
+  if (!isnan(tempC_last) && tempC_last >= 34.0f && tempC_last <= 43.0f) {
+    tempSum += tempC_last;
+    tempCount++;
+  }
+
+  DBG("Initial TEMP = ");
+  if (!isnan(tempC_last)) DBGLN(tempC_last);
+  else DBGLN("NA");
+
+  lastStickState = ST_IDLE;
+  lastSwRaw = true;
+  swStable = true;
+  swChangeMs = millis();
+
+  DBGLN("Sampling started (MAX30102 library mode, 15s window)");
+}
+
+void processSamplingPending() {
+  if (!samplingPending) return;
+
+  static bool waitLogged = false;
+  if (!waitLogged) {
+    DBGLN("Prepare delay running...");
+    waitLogged = true;
+  }
+
+  if (millis() - samplingPendingStartMs >= PREPARE_DELAY_MS) {
+    waitLogged = false;
+    startSampling();
+  }
+}
+
+void finishSamplingAndSendResult() {
+  samplingActive = false;
+  DBGLN("===== MEASURE DONE =====");
+
+  float t2 = readTempC_DS18B20();
+  if (!isnan(t2)) {
+    tempC_last = t2;
+    if (tempC_last >= 34.0f && tempC_last <= 43.0f) {
+      tempSum += tempC_last;
+      tempCount++;
+    }
+  }
+
+  bool hrValidAvg = (hrCount > 0);
+  bool spo2ValidAvg = (spo2Count > 0);
+  bool tempValidAvg = (tempCount > 0);
+
+  int bpm = hrValidAvg ? (int)((float)hrSum / (float)hrCount + 0.5f) : 0;
+  int spo2 = spo2ValidAvg ? (int)((float)spo2Sum / (float)spo2Count + 0.5f) : 0;
+  float tempAvg = tempValidAvg ? (tempSum / (float)tempCount) : NAN;
+  float tempResult = tempValidAvg ? (tempAvg + 0.5f) : NAN;
+
+  DBG("AVG HR valid count = "); DBGLN(hrCount);
+  DBG("AVG SPO2 valid count = "); DBGLN(spo2Count);
+  DBG("AVG TEMP valid count = "); DBGLN(tempCount);
+  if (tempValidAvg) {
+    DBG("Temp avg raw = "); DBG(tempAvg);
+    DBG(" | Temp output = "); DBGLN(tempResult);
+  }
+
+  char out[96];
+  if (hrValidAvg && spo2ValidAvg) {
+    if (!isnan(tempResult)) snprintf(out, sizeof(out), "RES,BPM=%d,SPO2=%d,TEMP=%.2f", bpm, spo2, tempResult);
+    else                    snprintf(out, sizeof(out), "RES,BPM=%d,SPO2=%d,TEMP=NA", bpm, spo2);
+  } else {
+    if (!isnan(tempResult)) snprintf(out, sizeof(out), "RES,FAIL,NO_VALID_SAMPLE,TEMP=%.2f", tempResult);
+    else                    snprintf(out, sizeof(out), "RES,FAIL,NO_VALID_SAMPLE,TEMP=NA");
+  }
+
+  Serial.println(out);
+
+  if (masterKnown) {
+    DBG("Send RES to "); DBGLN(MASTER_IP);
+    udpSendTo(MASTER_IP, MASTER_PORT_9000, out);
+    DBGLN("UDP send done");
+  } else {
+    DBGLN("No MASTER known yet -> only print to Serial");
+  }
+}
+
+
+void triggerMeasurement() {
+  samplingPending = true;
+  samplingActive = false;
+  samplingPendingStartMs = millis();
+
+  DBGLN("Got D -> wait 2s before real sampling");
+}
+
+bool isFingerPresentByValidData(int32_t spo2, int8_t spo2Valid, int32_t hr, int8_t hrValid) {
+  if (hrValid && hr > 30 && hr < 220) return true;
+  if (spo2Valid && spo2 >= 70 && spo2 <= 100) return true;
+  return false;
+}
+
+void processSampling() {
+  if (!samplingActive) return;
+
+  static uint32_t lastDbgMs = 0;
+  static uint32_t lastNoFingerMs = 0;
+
+  int32_t SPO2 = 0;
+  int8_t SPO2Valid = 0;
+  int32_t heartRate = 0;
+  int8_t heartRateValid = 0;
+
+  particleSensor.heartrateAndOxygenSaturation(&SPO2, &SPO2Valid, &heartRate, &heartRateValid);
+
+  bool fingerPresent = isFingerPresentByValidData(SPO2, SPO2Valid, heartRate, heartRateValid);
+
+  if (fingerPresent) {
+    fingerDetectedEver = true;
+    fingerLostNow = false;
+    fingerLostStartMs = 0;
+
+    if (heartRateValid && heartRate >= 55 && heartRate <= 110) {
+      hrSum += heartRate;
+      hrCount++;
+    }
+
+    if (SPO2Valid && SPO2 >= 90 && SPO2 <= 100) {
+      spo2Sum += SPO2;
+      spo2Count++;
+    }
+
+    if (heartRateValid && (heartRate < 55 || heartRate > 110)) {
+      DBG("HR sample ignored = "); DBGLN(heartRate);
+    }
+
+    if (millis() - lastDbgMs >= 1000) {
+      DBG("Sample OK | HR="); DBG(heartRate);
+      DBG(" valid="); DBG(heartRateValid);
+      DBG(" | SPO2="); DBG(SPO2);
+      DBG(" valid="); DBG(SPO2Valid);
+      DBG(" | hrCount="); DBG(hrCount);
+      DBG(" | spo2Count="); DBG(spo2Count);
+      DBG(" | tempCount="); DBGLN(tempCount);
+      lastDbgMs = millis();
+    }
+  } else {
+    if (fingerDetectedEver) {
+      if (!fingerLostNow) {
+        fingerLostNow = true;
+        fingerLostStartMs = millis();
+        DBGLN("Finger removed? waiting confirm...");
+      } else if (millis() - fingerLostStartMs >= FINGER_LOST_ABORT_MS) {
+        samplingActive = false;
+
+        float tempResult = NAN;
+        if (tempCount > 0) {
+          float tempAvg = tempSum / (float)tempCount;
+          tempResult = tempAvg + 0.5f;
+          DBG("Temp avg raw = "); DBG(tempAvg);
+          DBG(" | Temp output = "); DBGLN(tempResult);
+        }
+
+        char out[96];
+        if (!isnan(tempResult)) snprintf(out, sizeof(out), "RES,FAIL,FINGER_REMOVED,TEMP=%.2f", tempResult);
+        else                    snprintf(out, sizeof(out), "RES,FAIL,FINGER_REMOVED,TEMP=NA");
+
+        DBGLN("===== MEASURE FAILED =====");
+        Serial.println(out);
+
+        if (masterKnown) {
+          DBG("Send FAIL to "); DBGLN(MASTER_IP);
+          udpSendTo(MASTER_IP, MASTER_PORT_9000, out);
+          DBGLN("UDP send done");
+        } else {
+          DBGLN("No MASTER known yet -> only print to Serial");
+        }
+        return;
+      }
+    } else {
+      if (millis() - lastNoFingerMs >= 1000) {
+        DBGLN("Waiting finger...");
+        lastNoFingerMs = millis();
+      }
+    }
+  }
+
+  if (millis() - tempLastReadMs >= 2000) {
+    float t = readTempC_DS18B20();
+    if (!isnan(t)) {
+      tempC_last = t;
+      if (t >= 34.0f && t <= 43.0f) {
+        tempSum += t;
+        tempCount++;
+        DBG("TEMP sample accepted = "); DBGLN(t);
+      } else {
+        DBG("TEMP sample ignored = "); DBGLN(t);
+      }
+    } else {
+      DBGLN("TEMP sample invalid = NAN");
+    }
+    tempLastReadMs = millis();
+  }
+
+  if (millis() - sampleStartMs >= SAMPLE_WINDOW_MS) {
+    finishSamplingAndSendResult();
+    return;
+  }
+
+  delay(40);
+}
+
+// ================= Receive "D" from master =================
+void handleIncomingFromMaster() {
+  int p = Udp.parsePacket();
+  if (p <= 0) return;
+
+  IPAddress rip = Udp.remoteIP();
+  uint16_t rport = Udp.remotePort();
+
+  int n = Udp.read(rxBuf, sizeof(rxBuf) - 1);
+  if (n <= 0) return;
+  rxBuf[n] = '\0';
+
+  while (n > 0 && (rxBuf[n - 1] == '\n' || rxBuf[n - 1] == '\r')) {
+    rxBuf[n - 1] = '\0';
+    n--;
+  }
+
+  DBG("UDP RX = "); DBGLN(rxBuf);
+
+  if (strcmp(rxBuf, "D") == 0) {
+    MASTER_IP = rip;
+    masterKnown = true;
+
+    DBG("Got D from "); DBGLN(rip);
+    DBG("remotePort="); DBGLN(rport);
+
+    uint16_t ackPort = (rport != 0) ? rport : MASTER_ACK_FALLBACK;
+    udpSendTo(rip, ackPort, "ACK:D");
+    DBGLN("Sent ACK:D");
+
+    triggerMeasurement();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println("=== SLAVER BOOT ===");
+
+  pinMode(PIN_SW, INPUT_PULLUP);
+  analogReadResolution(12);
+  pinMode(PIN_BTN8, INPUT_PULLUP);
+
+  // DS18B20
+  pinMode(DS_PIN, INPUT_PULLUP);
+  ds18b20.begin();
+  ds18b20.setWaitForConversion(true);
+  ds18b20.setResolution(12);
+  ds_ok = (ds18b20.getDeviceCount() > 0);
+
+  // ===== Static IP for SLAVE =====
+  IPAddress localIP(172,20,10,201);
+  IPAddress gateway(172,20,10,1);
+  IPAddress subnet(255,255,255,0);
+  IPAddress dns1(8,8,8,8);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(localIP, gateway, subnet, dns1);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(200);
+  }
+  Serial.println();
+
+  DBG("SLAVE IP = "); DBGLN(WiFi.localIP());
+
+  // UDP listen D
+  Udp.begin(SLAVE_LISTEN_PORT);
+  DBGLN("UDP listen 9100");
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  hr_ok = max30102Init();
+
+  DBG("MAX30102 ok = "); DBGLN(hr_ok ? "YES" : "NO");
+  DBG("DS18B20 ok  = "); DBGLN(ds_ok ? "YES" : "NO");
+  DBGLN("Type D in Serial Monitor or send UDP 'D' to start measuring");
+}
+
+void loop() {
+  handleIncomingFromMaster();
+  // ===== Nhận lệnh D từ Serial Monitor =====
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.equalsIgnoreCase("D")) {
+      Serial.println("CMD from SERIAL: D");
+      triggerMeasurement();
+    }
+  }
+  if (samplingPending) {
+    processSamplingPending();
+    delay(10);
+    return;
+  }
+
+  if (samplingActive) {
+    processSampling();
+    delay(10);
+    return;
+  }
+
+  handleButton8OneShot();
+  handleSwitch();
+  handleStick();
+  delay(10);
+}
