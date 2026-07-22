@@ -268,21 +268,8 @@ Store secrets in local configuration files that are excluded through `.gitignore
 - Add remote monitoring for caregivers and rehabilitation centers
 
 ## Project Images
-
-After uploading the corresponding image files, add them to this README:
-
-```markdown
-![System Architecture](system-architecture.png)
-![Central Gateway PCB](gateway-pcb.png)
-![Hardware Prototype](prototype.jpg)
-```
-
-## Author
-
-**Nguyễn Huỳnh Khánh Lâm**  
-Electronics and Telecommunications Engineering  
-Ton Duc Thang University
-
-## License
-
-This repository is intended for educational and research purposes.
+<img width="495" height="272" alt="image" src="https://github.com/user-attachments/assets/db5f1ad6-4891-4551-89a8-6d017cd8fa4b" />
+<img width="492" height="356" alt="image" src="https://github.com/user-attachments/assets/f71c98b3-261c-4d1a-9ab6-52508b856fe3" />
+<img width="492" height="272" alt="image" src="https://github.com/user-attachments/assets/88f16ddb-a400-4e8b-ab77-74a9411a9aa3" />
+<img width="504" height="458" alt="image" src="https://github.com/user-attachments/assets/7fd405e0-1ea2-4dc4-a4bf-b45bcfc6855b" />
+<img width="762" height="386" alt="image" src="https://github.com/user-attachments/assets/be15ff24-09ba-4c89-b775-4b2e34b837cc" />
